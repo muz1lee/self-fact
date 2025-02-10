@@ -1,0 +1,52 @@
+# 模型文件夹
+Meta-Llama-3-8B-Instruct/
+models/
+checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 环境
+.env
+.venv
+env/
+venv/
+ENV/
+
+# 日志和输出
+*.log
+outputs/
+runs/
+wandb/
+logs/
+
+# 系统文件
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 数据文件
+*.bin
+*.pt
+*.pth
