@@ -39,17 +39,15 @@ if TYPE_CHECKING:
     from ...hparams import DataArguments, FinetuningArguments
 
 
-def run_dpo(
+
+def calculate_confidence_signals(
     model_args: "ModelArguments",
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
     finetuning_args: "FinetuningArguments",
-    callbacks: Optional[List["TrainerCallback"]] = None,
-):
-    # 根据 get_confidence 参数执行不同的流程
-    if finetuning_args.get_confidence:
-
-        # 首先加载基础组件
+    callbacks: Optional[List["TrainerCallback"]] = None):
+        
+    # 首先加载基础组件
         tokenizer_module = load_tokenizer(model_args)
         tokenizer = tokenizer_module["tokenizer"]
         template = get_template_and_fix_tokenizer(tokenizer, data_args)
@@ -62,20 +60,33 @@ def run_dpo(
 
         # 准备当前模型和参考模型
         if finetuning_args.use_ref_model:
-            # 参考模型使用基座模型
             ref_model = base_model
             
             # 当前模型加载 adapter
             if finetuning_args.peft_path and finetuning_args.add_adapter:
-                from peft import PeftModel
-                print(f"Loading model adapter from {finetuning_args.peft_path}")
-                model = PeftModel.from_pretrained(
-                    base_model,
-                    finetuning_args.peft_path,
-                    is_trainable=False
-                )
+                adapter_path = finetuning_args.peft_path
+                adapter_config = os.path.join(adapter_path, "adapter_config.json")
+                
+                # 检查 adapter 配置文件是否存在
+                if not os.path.exists(adapter_config):
+                    print(f"Warning: Cannot find adapter config at {adapter_config}")
+                    print("Using base model instead.")
+                    model = base_model
+                else:
+                    from peft import PeftModel
+                    print(f"Loading model adapter from {adapter_path}")
+                    try:
+                        model = PeftModel.from_pretrained(
+                            base_model,
+                            adapter_path,
+                            is_trainable=False
+                        )
+                    except Exception as e:
+                        print(f"Error loading adapter: {str(e)}")
+                        print("Using base model instead.")
+                        model = base_model
             else:
-                model = base_model  # 如果没有 adapter，使用基座模型
+                model = base_model
         else:
             ref_model = None
             model = base_model
@@ -172,6 +183,24 @@ def run_dpo(
         
         print(f"\nProcessed and saved {len(all_data)} samples.")
         print(f"Results saved to: {output_file}")
+
+def run_dpo(
+    model_args: "ModelArguments",
+    data_args: "DataArguments",
+    training_args: "Seq2SeqTrainingArguments",
+    finetuning_args: "FinetuningArguments",
+    callbacks: Optional[List["TrainerCallback"]] = None,
+):
+    # 根据 get_confidence 参数执行不同的流程
+    if finetuning_args.get_confidence:
+        calculate_confidence_signals(
+            model_args=model_args,
+            data_args=data_args,
+            training_args=training_args,
+            finetuning_args=finetuning_args,
+            callbacks=callbacks
+        )
+        
     else:
         tokenizer_module = load_tokenizer(model_args)
         tokenizer = tokenizer_module["tokenizer"]

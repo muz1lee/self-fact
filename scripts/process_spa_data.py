@@ -1,7 +1,7 @@
 import json
 from datasets import Dataset
 
-def process_predictions(file_path="/mnt/sda/llmfact/LLaMA-Factory/generated_predictions.jsonl"):
+def process_predictions(file_path):
     processed_data = []
     
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -34,6 +34,7 @@ def process_predictions(file_path="/mnt/sda/llmfact/LLaMA-Factory/generated_pred
 
 # 使用示例
 if __name__ == "__main__":
+    file_path="/mnt/sda/llmfact/LLaMA-Factory/generated_predictions.jsonl"
     dataset = process_predictions()
     # 保存为新的数据集
     dataset.save_to_disk("processed_spa_data")
