@@ -249,6 +249,15 @@ class RLHFArguments:
         metadata={"help": "confidence_type"}
     )
 
+    add_adapter: Optional[bool] = field(
+        default=False,
+        metadata={"help": "introduce adapter model"}
+    )
+
+    peft_path: Optional[str] = field(
+        default="adapter's path", # policy or ref
+        metadata={"help": "adapter's path"}
+    )
 @dataclass
 class GaloreArguments:
     r"""
@@ -497,7 +506,7 @@ class FinetuningArguments(
         self.freeze_vision_tower = self.freeze_vision_tower or self.train_mm_proj_only
         self.freeze_multi_modal_projector = self.freeze_multi_modal_projector and not self.train_mm_proj_only
         self.use_ref_model = self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]
-        print('self.use_ref_model',self.use_ref_model)
+       
         assert self.finetuning_type in ["lora", "freeze", "full"], "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."

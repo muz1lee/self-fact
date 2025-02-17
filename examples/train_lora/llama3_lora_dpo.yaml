@@ -1,41 +1,43 @@
 ### model
-model_name_or_path: /mnt/sda/llmfact/models/Meta-Llama-3-8B
+model_name_or_path: /mnt/sda/llmfact/models/Meta-Llama-3-8B-Instruct
+# model_name_or_path: /mnt/sda/llmfact/LLaMA-Factory/models/llama3_lora_cold_start
+# /mnt/sda/llmfact/LLaMA-Factory/spa_exp/llama3-8b/distill/mix_0.5
 trust_remote_code: true
 
 ### method
 stage: dpo
-do_train: false
+do_train: true
 finetuning_type: lora
 lora_target: all
 pref_beta: 0.1
-pref_loss: distill  # choices: [sigmoid (dpo), orpo, simpo, distill]
+pref_loss: sigmoid  # choices: [sigmoid (dpo), orpo, simpo, distill]
 
 
-confidence_dir: spa_exp/llama3-8b-bio/distill/mix_0.75
-save_confidence_name: save_confidence
+## ours
 get_confidence: true 
-
-## spa 
+confidence_dir: spa_exp/llama3-8b-bio/spa
+save_confidence_name: save_confidence
 decouple_denoising: 0.75 # mixing parameter ( lambda in eq 12.)
 # ref_model: /mnt/sda/llmfact/models/Meta-Llama-3-8B # Meta-Llama-3-8B-Instruct
 self_refine_threshold: 1 # threshold for self-refine
 refine_stragth: 0.1 # alpha in eq.10 
-confidence_type: policy
-
+peft_path: /mnt/sda/llmfact/LLaMA-Factory/spa_exp/llama3-8b/distill/mix_0.5/checkpoint-99
+add_adapter: true
 
 ### dataset
-dataset: biography_preference  # choices:[ultrafeedback, dpo_en_demo, dpo_mix_zh]
+dataset: biography_preference  # choices:[ultrafeedback, dpo_en_demo, dpo_mix_zh, biography_preference]
 template: llama3
 cutoff_len: 2048 # 输入的最大 token 数，超过该长度会被截断。
-max_samples: 2000
+max_samples: 1000
 overwrite_cache: true
 preprocessing_num_workers: 16
 ### output
-output_dir: spa_exp/llama3-8b-bio/distill/mix_0.75
+output_dir: spa_exp/llama3-8b-cold-start
 logging_steps: 10
 save_steps: 500
 plot_loss: true
 overwrite_output_dir: true
+
 
 ### train
 per_device_train_batch_size: 1
