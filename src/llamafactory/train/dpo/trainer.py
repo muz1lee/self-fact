@@ -92,6 +92,8 @@ class CustomDPOTrainer(DPOTrainer):
         self.self_refine_threshold = finetuning_args.self_refine_threshold
         self.refine_stragth = finetuning_args.refine_stragth
         # self.confidence_type = finetuning_args.confidence_type
+
+        self.confidence = None  # 在训练阶段导入
         self.save_dataset = {}
 
         Trainer.__init__(self, model=model, **kwargs)
@@ -173,8 +175,12 @@ class CustomDPOTrainer(DPOTrainer):
         self,
         policy_chosen_logps: "torch.Tensor",
         policy_rejected_logps: "torch.Tensor",
+        policy_chosen_logits:  "torch.Tensor",
+        policy_rejected_logits:  "torch.Tensor",
         reference_chosen_logps: Optional["torch.Tensor"],
         reference_rejected_logps: Optional["torch.Tensor"],
+        reference_chosen_logits: Optional["torch.Tensor"],
+        reference_reject_logits: Optional["torch.Tensor"],
     ) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
         r"""
         Computes loss for preference learning.
@@ -190,9 +196,36 @@ class CustomDPOTrainer(DPOTrainer):
             chosen_rewards = self.beta * policy_chosen_logps.to(self.accelerator.device).detach()
             rejected_rewards = self.beta * policy_rejected_logps.to(self.accelerator.device).detach()
         else:
+
+        
+            with torch.no_grad():
+                mix_chosen_logits = (policy_chosen_logits * self.mix + reference_chosen_logits * (1- self.mix)).detach()
+                mix_rejected_logits = (policy_rejected_logits * self.mix  + reference_reject_logits * (1- self.mix)).detach()
+                
+                labels = batch["chosen_labels"]
+                if not self.is_encoder_decoder:
+                    labels = batch["chosen_labels"][:, 1:].clone()
+                    logits = mix_chosen_logits[:, :-1, :]
+                loss_mask = labels != self.label_pad_token_id
+                labels[labels == self.label_pad_token_id] = 0
+                per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+                mix_chosen_logps = (per_token_logps * loss_mask).sum(-1)
+                labels = batch["rejected_labels"]
+                if not self.is_encoder_decoder:
+                    labels = batch["rejected_labels"][:, 1:].clone()
+                    logits = mix_rejected_logits[:, :-1, :]
+                loss_mask = labels != self.label_pad_token_id
+                labels[labels == self.label_pad_token_id] = 0
+                per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+                mix_rejected_logps = (per_token_logps * loss_mask).sum(-1)
+
+            
             losses, chosen_rewards, rejected_rewards = self.dpo_loss(
-                policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps
+                policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps,
+                mix_chosen_logps,mix_rejected_logps
             )
+
+        
 
         return losses, chosen_rewards, rejected_rewards
 
@@ -243,9 +276,9 @@ class CustomDPOTrainer(DPOTrainer):
             
 
         with torch.no_grad(), ref_context:
-            reference_chosen_logps, reference_rejected_logps, *_ = self.concatenated_forward(ref_model, batch)
+            reference_chosen_logps, reference_rejected_logps, reference_chosen_logits,reference_rejected_logits = self.concatenated_forward(ref_model, batch)
 
-        return reference_chosen_logps, reference_rejected_logps
+        return reference_chosen_logps, reference_rejected_logps, reference_chosen_logits,reference_rejected_logits
 
     @override
     def get_batch_loss_metrics(
@@ -266,12 +299,22 @@ class CustomDPOTrainer(DPOTrainer):
             policy_chosen_logps_avg,
         ) = self.concatenated_forward(model, batch)
 
-        reference_chosen_logps, reference_rejected_logps = self.compute_reference_log_probs(model, batch)
+        (
+            reference_chosen_logps, 
+            reference_rejected_logps,
+            reference_chosen_logits,
+            reference_rejected_logits,
+        ) = self.compute_reference_log_probs(model, batch)
+        
         losses, chosen_rewards, rejected_rewards = self.compute_preference_loss(
             policy_chosen_logps,
             policy_rejected_logps,
+            policy_chosen_logits,
+            policy_rejected_logits,
             reference_chosen_logps,
             reference_rejected_logps,
+            reference_chosen_logits,
+            reference_rejected_logits
         )
         sft_loss = -policy_chosen_logps_avg
         if self.ftx_gamma > 1e-6:
@@ -340,7 +383,7 @@ class CustomDPOTrainer(DPOTrainer):
         if not hasattr(self, 'data_counter'):
             self.data_counter = 0
 
-        policy_chosen_logps, policy_rejected_logps, _, _, _ = self.concatenated_forward(model, batch)
+        policy_chosen_logps, policy_rejected_logps, *_ = self.concatenated_forward(model, batch)
         reference_chosen_logps, reference_rejected_logps = self.compute_reference_log_probs_spa(model, batch)
 
         # Calculate individual rewards
