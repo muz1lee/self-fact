@@ -645,5 +645,17 @@
     "chosen": "chosen",
     "rejected": "rejected"
   }
+},
+"biography_mix": {
+  "file_name": "biography_mix.json",
+  "ranking": true,
+  "columns": {
+    "prompt": "instruction",
+    "query": "input",
+    "chosen": "chosen",
+    "rejected": "rejected",
+    "chosen_reward": "chosen_reward",
+    "rejected_reward": "rejected_reward"
+  }
 }
 }

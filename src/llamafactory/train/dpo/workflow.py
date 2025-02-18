@@ -120,24 +120,16 @@ def calculate_confidence_signals(
         
         # 合并数据集
         from torch.utils.data import ConcatDataset
-        combined_dataset = ConcatDataset([train_dataset, eval_dataset])
+        combined_dataset = ConcatDataset([train_dataset,eval_dataset])
         
         total_samples = len(combined_dataset)
         print(f"Total samples for confidence calculation: {total_samples}")
         print(f"(Training: {len(train_dataset)}, Validation: {len(eval_dataset)})")
         
         # 在开始处理前，创建空的 JSON 文件
-        output_file = f"{trainer.confidence_dir}/{trainer.save_confidence_name}"
+        output_file = f"{trainer.confidence_dir}/{trainer.save_confidence_name}.json"
         os.makedirs(trainer.confidence_dir, exist_ok=True)
         all_data = []
-        
-        def save_data(data, file_path):
-            with open(file_path, 'w', encoding='utf-8') as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
-                    json.dump(data, f, ensure_ascii=False, indent=4)
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         
         model = trainer.model
         model.eval()
@@ -183,6 +175,19 @@ def calculate_confidence_signals(
         
         print(f"\nProcessed and saved {len(all_data)} samples.")
         print(f"Results saved to: {output_file}")
+
+
+def save_data(data, file_path):
+    # 确保 data 是单个列表而不是列表的列表
+    if isinstance(data[0], list):
+        data = [item for sublist in data for item in sublist]  # 展平嵌套列表
+        
+    with open(file_path, 'w', encoding='utf-8') as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 def run_dpo(
     model_args: "ModelArguments",

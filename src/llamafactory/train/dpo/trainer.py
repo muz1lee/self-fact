@@ -33,14 +33,28 @@ from ...extras.packages import is_transformers_version_greater_than
 from ..callbacks import SaveProcessorCallback
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler, get_batch_logps, nested_detach
 
-import os
-import json
-from filelock import FileLock
+
+from collections import deque
+
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel, ProcessorMixin
 
     from ...hparams import FinetuningArguments
+
+
+class TorchRunningMean:
+    def __init__(self, momentom = 0.5,  shape=(), device=None):
+        self.mean = torch.zeros(shape, device=device)
+        self.momentom = momentom
+        self.before_mean = torch.zeros(shape, device=device)
+
+    def update(self, x):
+        with torch.no_grad():
+            batch_mean = x
+            self.mean =  (1-self.momentom) *  self.mean + self.momentom * batch_mean
+            self.before_mean = x
+        return self.mean 
 
 
 class CustomDPOTrainer(DPOTrainer):
@@ -88,12 +102,19 @@ class CustomDPOTrainer(DPOTrainer):
         self.confidence_dir = finetuning_args.confidence_dir
         self.save_confidence_name = finetuning_args.save_confidence_name
         self.get_confidence = finetuning_args.get_confidence
-        self.decouple_denoising = finetuning_args.decouple_denoising
-        self.self_refine_threshold = finetuning_args.self_refine_threshold
-        self.refine_stragth = finetuning_args.refine_stragth
-        # self.confidence_type = finetuning_args.confidence_type
+        self.mix = finetuning_args.decouple_denoising
+        self.alpha = finetuning_args.refine_stragth
+        self.confidence = torch.tensor([0.0])
+        self.confidence_last = torch.tensor([0.0])
+        self.threshold = finetuning_args.self_refine_threshold
 
-        self.confidence = None  # 在训练阶段导入
+        self._stored_metrics = defaultdict(lambda: defaultdict(list))
+        self._stored_metrics_step = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50)))
+        
+
+        self.runnging_confidence = TorchRunningMean(device='cpu')
+     
+        # self.confidence_type = finetuning_args.confidence_type
         self.save_dataset = {}
 
         Trainer.__init__(self, model=model, **kwargs)
@@ -180,7 +201,8 @@ class CustomDPOTrainer(DPOTrainer):
         reference_chosen_logps: Optional["torch.Tensor"],
         reference_rejected_logps: Optional["torch.Tensor"],
         reference_chosen_logits: Optional["torch.Tensor"],
-        reference_reject_logits: Optional["torch.Tensor"],
+        reference_rejected_logits: Optional["torch.Tensor"],
+        batch: Optional[Dict[str, "torch.Tensor"]] = None,  # 添加 batch 参数
     ) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
         r"""
         Computes loss for preference learning.
@@ -196,38 +218,68 @@ class CustomDPOTrainer(DPOTrainer):
             chosen_rewards = self.beta * policy_chosen_logps.to(self.accelerator.device).detach()
             rejected_rewards = self.beta * policy_rejected_logps.to(self.accelerator.device).detach()
         else:
+            
+            if batch is not None and hasattr(self, 'mix'):
+                with torch.no_grad():
+                    mix_chosen_logits = (policy_chosen_logits * self.mix + reference_chosen_logits * (1 - self.mix)).detach()
+                    mix_rejected_logits = (policy_rejected_logits * self.mix + reference_rejected_logits * (1 - self.mix)).detach()
+                    
+                    # 从 batch 中分割 chosen 和 rejected 的标签
+                    batch_size = batch["input_ids"].size(0) // 2
+                    chosen_labels = batch["labels"][:batch_size]  # 前半部分是 chosen
+                    rejected_labels = batch["labels"][batch_size:]  # 后半部分是 rejected
+                    
+                    # 处理 chosen labels
+                    labels = chosen_labels
+                    if not self.is_encoder_decoder:
+                        labels = chosen_labels[:, 1:].clone()
+                        logits = mix_chosen_logits[:, :-1, :]
+                    loss_mask = labels != self.label_pad_token_id
+                    labels[labels == self.label_pad_token_id] = 0
+                    per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+                    mix_chosen_logps = (per_token_logps * loss_mask).sum(-1)
+                    
+                    # 处理 rejected labels
+                    labels = rejected_labels
+                    if not self.is_encoder_decoder:
+                        labels = rejected_labels[:, 1:].clone()
+                        logits = mix_rejected_logits[:, :-1, :]
+                    loss_mask = labels != self.label_pad_token_id
+                    labels[labels == self.label_pad_token_id] = 0
+                    per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+                    mix_rejected_logps = (per_token_logps * loss_mask).sum(-1)
 
-        
-            with torch.no_grad():
-                mix_chosen_logits = (policy_chosen_logits * self.mix + reference_chosen_logits * (1- self.mix)).detach()
-                mix_rejected_logits = (policy_rejected_logits * self.mix  + reference_reject_logits * (1- self.mix)).detach()
+            # with torch.no_grad():
+            #     mix_chosen_logits = (policy_chosen_logits * self.mix + reference_chosen_logits * (1- self.mix)).detach()
+            #     mix_rejected_logits = (policy_rejected_logits * self.mix  + reference_reject_logits * (1- self.mix)).detach()
                 
-                labels = batch["chosen_labels"]
-                if not self.is_encoder_decoder:
-                    labels = batch["chosen_labels"][:, 1:].clone()
-                    logits = mix_chosen_logits[:, :-1, :]
-                loss_mask = labels != self.label_pad_token_id
-                labels[labels == self.label_pad_token_id] = 0
-                per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
-                mix_chosen_logps = (per_token_logps * loss_mask).sum(-1)
-                labels = batch["rejected_labels"]
-                if not self.is_encoder_decoder:
-                    labels = batch["rejected_labels"][:, 1:].clone()
-                    logits = mix_rejected_logits[:, :-1, :]
-                loss_mask = labels != self.label_pad_token_id
-                labels[labels == self.label_pad_token_id] = 0
-                per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
-                mix_rejected_logps = (per_token_logps * loss_mask).sum(-1)
+            
+            #     labels = batch["chosen_labels"]
+            #     if not self.is_encoder_decoder:
+            #         labels = batch["chosen_labels"][:, 1:].clone()
+            #         logits = mix_chosen_logits[:, :-1, :]
+            #     loss_mask = labels != self.label_pad_token_id
+            #     labels[labels == self.label_pad_token_id] = 0
+            #     per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+            #     mix_chosen_logps = (per_token_logps * loss_mask).sum(-1)
+            #     labels = batch["rejected_labels"]
+            #     if not self.is_encoder_decoder:
+            #         labels = batch["rejected_labels"][:, 1:].clone()
+            #         logits = mix_rejected_logits[:, :-1, :]
+            #     loss_mask = labels != self.label_pad_token_id
+            #     labels[labels == self.label_pad_token_id] = 0
+            #     per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+            #     mix_rejected_logps = (per_token_logps * loss_mask).sum(-1)
 
             
-            losses, chosen_rewards, rejected_rewards = self.dpo_loss(
+            losses, chosen_rewards, rejected_rewards,mix_margin = self.dpo_loss(
                 policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps,
                 mix_chosen_logps,mix_rejected_logps
             )
 
         
 
-        return losses, chosen_rewards, rejected_rewards
+        return losses, chosen_rewards, rejected_rewards,mix_margin
 
     @override
     def concatenated_forward(
@@ -276,7 +328,7 @@ class CustomDPOTrainer(DPOTrainer):
             
 
         with torch.no_grad(), ref_context:
-            reference_chosen_logps, reference_rejected_logps, reference_chosen_logits,reference_rejected_logits = self.concatenated_forward(ref_model, batch)
+            reference_chosen_logps, reference_rejected_logps, reference_chosen_logits,reference_rejected_logits, _ = self.concatenated_forward(ref_model, batch)
 
         return reference_chosen_logps, reference_rejected_logps, reference_chosen_logits,reference_rejected_logits
 
@@ -306,7 +358,7 @@ class CustomDPOTrainer(DPOTrainer):
             reference_rejected_logits,
         ) = self.compute_reference_log_probs(model, batch)
         
-        losses, chosen_rewards, rejected_rewards = self.compute_preference_loss(
+        losses, chosen_rewards, rejected_rewards,mix_margin = self.compute_preference_loss(
             policy_chosen_logps,
             policy_rejected_logps,
             policy_chosen_logits,
@@ -314,7 +366,8 @@ class CustomDPOTrainer(DPOTrainer):
             reference_chosen_logps,
             reference_rejected_logps,
             reference_chosen_logits,
-            reference_rejected_logits
+            reference_rejected_logits,
+            batch
         )
         sft_loss = -policy_chosen_logps_avg
         if self.ftx_gamma > 1e-6:
@@ -325,6 +378,7 @@ class CustomDPOTrainer(DPOTrainer):
         metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().item()
         metrics[f"{prefix}rewards/accuracies"] = (chosen_rewards > rejected_rewards).float().mean().item()
         metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().item()
+        metrics[f"{prefix}rewards/mix_margin"] = mix_margin.mean().item()
         metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.mean().item()
         metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.mean().item()
         metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.mean().item()
@@ -378,11 +432,6 @@ class CustomDPOTrainer(DPOTrainer):
         batch: Dict[str, "torch.Tensor"]
     ) -> Tuple["torch.Tensor", Dict[str, "torch.Tensor"]]:
         
-    
-        
-        if not hasattr(self, 'data_counter'):
-            self.data_counter = 0
-
         policy_chosen_logps, policy_rejected_logps, *_ = self.concatenated_forward(model, batch)
         reference_chosen_logps, reference_rejected_logps = self.compute_reference_log_probs_spa(model, batch)
 
@@ -390,54 +439,32 @@ class CustomDPOTrainer(DPOTrainer):
         chosen_rewards = (policy_chosen_logps - reference_chosen_logps).detach()
         rejected_rewards = (policy_rejected_logps - reference_rejected_logps).detach()
 
-        # 获取每组数据的 query
-        batch_size = batch['input_ids'].size(0) // 2  # DPO 数据是成对的
-        chosen_inputs = batch['input_ids'][:batch_size]  # 前半部分是 chosen
-        rejected_inputs = batch['input_ids'][batch_size:]  # 后半部分是 rejected
+        # 获取每组数据
+        batch_size = batch['input_ids'].size(0) // 2
+        chosen_inputs = batch['input_ids'][:batch_size]
+        rejected_inputs = batch['input_ids'][batch_size:]
 
-        # 获取每组数据的 query 和回答
-        queries = []
-        chosen_responses = []
-        rejected_responses = []
+        entries = []
         for i in range(batch_size):
-            # 解码 chosen 和 rejected 文本
+            # 解码文本
             chosen_text = self.processing_class.decode(chosen_inputs[i], skip_special_tokens=True)
             rejected_text = self.processing_class.decode(rejected_inputs[i], skip_special_tokens=True)
-            
-            # 提取用户问题和助手回答部分
-            try:
-                # 分离问题和回答
-                question = chosen_text.split("Human: ")[1].split("\nAssistant:")[0].strip()
-                chosen_response = chosen_text.split("\nAssistant:")[1].split("Human:")[0].strip()
-                rejected_response = rejected_text.split("\nAssistant:")[1].split("Human:")[0].strip()
-            except IndexError:
-                question = f"query_{self.data_counter}"
-                chosen_response = chosen_text
-                rejected_response = rejected_text
-            
-            queries.append(question)
-            chosen_responses.append(chosen_response)
-            rejected_responses.append(rejected_response)
-            self.data_counter += 1  # 每处理一条数据就增加计数器
-
-        # 创建数据条目
-        entries = []
-        for query, chosen, rejected, c_r, r_r in zip(
-            queries,
-            chosen_responses,
-            rejected_responses,
-            chosen_rewards.cpu().tolist(),
-            rejected_rewards.cpu().tolist()
-        ):
+        
+            # 提取问题和回答
+            prompt = chosen_text.split("Assistant:")[0].strip()
+            chosen = chosen_text.split("Assistant:")[1].split("Human:")[0].strip()
+            rejected = rejected_text.split("Assistant:")[1].split("Human:")[0].strip()
+                
+             
             new_entry = {
-                "query": query,
-                "chosen_response": chosen,
-                "rejected_response": rejected,
-                "chosen_reward": c_r,
-                "rejected_reward": r_r
+                "instruction": prompt,
+                "input": "",
+                "chosen": chosen,
+                "rejected": rejected,
+                "chosen_reward": chosen_rewards[i].cpu().item(),
+                "rejected_reward": rejected_rewards[i].cpu().item()
             }
             entries.append(new_entry)
-            self.data_counter += 1
         
         return entries
     
